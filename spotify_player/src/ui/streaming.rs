@@ -7,7 +7,9 @@ use librespot_playback::{
     decoder::AudioPacket,
 };
 use parking_lot::Mutex;
+use rand::RngExt;
 use ratatui::{
+    buffer::Cell,
     layout::Rect,
     style::{Color, Style},
     widgets::{Bar, BarChart, BarGroup},
@@ -67,6 +69,9 @@ pub struct VisBands {
     /// `Paused` or `stop()`.  The UI uses this flag to skip rendering (and
     /// reclaim the screen space) when audio is not being streamed locally.
     pub is_active: bool,
+    /// When the chart last opened or started closing, for the cava-fed glitch transition.
+    opened_at: Option<Instant>,
+    closing_at: Option<Instant>,
 }
 
 impl VisBands {
@@ -76,6 +81,39 @@ impl VisBands {
             updated_at: Instant::now(),
             peak_envelope: 1e-6,
             is_active: false,
+            opened_at: None,
+            closing_at: None,
+        }
+    }
+
+    /// Open or close the chart. Closing keeps `is_active` set until the glitch has
+    /// played, because the layout frees the chart's rows as soon as it is unset.
+    fn transition(&mut self, has_sound: bool, now: Instant) {
+        if has_sound {
+            self.closing_at = None;
+            if !self.is_active {
+                self.is_active = true;
+                self.opened_at = Some(now);
+            }
+        } else if self.is_active {
+            let closing_at = *self.closing_at.get_or_insert(now);
+            if now.duration_since(closing_at) >= GLITCH_DURATION {
+                self.is_active = false;
+                self.closing_at = None;
+                self.opened_at = None;
+            }
+        }
+    }
+
+    /// Glitch strength in [0, 1]: fades out after opening and builds up while closing.
+    fn glitch_amount(&self, now: Instant) -> f32 {
+        let progress = |since: Instant| {
+            (now.duration_since(since).as_secs_f32() / GLITCH_DURATION.as_secs_f32()).min(1.0)
+        };
+        if let Some(closing_at) = self.closing_at {
+            progress(closing_at)
+        } else {
+            self.opened_at.map_or(0.0, |opened_at| 1.0 - progress(opened_at))
         }
     }
 }
@@ -370,6 +408,14 @@ fn bar_color(t: f32, low: Color, mid: Color, high: Color) -> Color {
 const CAVA_SILENCE_TIMEOUT: Duration = Duration::from_secs(2);
 const CAVA_RESTART_DELAY: Duration = Duration::from_secs(5);
 const CAVA_MAX_RANGE: f32 = 1000.0;
+/// Below cava's default of 77, which lets bars take about 0.7 s to fall.
+const CAVA_NOISE_REDUCTION: u8 = 60;
+const CAVA_LOWEST_HZ: u32 = 20;
+const CAVA_HIGHEST_HZ: u32 = 20_000;
+const GLITCH_DURATION: Duration = Duration::from_millis(260);
+/// Furthest a row slides sideways during a glitch, as a fraction of the chart's width.
+const GLITCH_MAX_SHIFT: f32 = 0.06;
+const GLITCH_GLYPHS: [&str; 6] = ["▀", "▄", "▌", "▐", "▓", "░"];
 
 /// Feed the visualization from a `cava` process capturing the given `PulseAudio` source,
 /// so playback on another local player (a Spotify Connect device) can be visualized.
@@ -393,10 +439,12 @@ fn read_cava_output(bands: &Mutex<VisBands>, source: &str, cache_folder: &Path) 
         &config_path,
         format!(
             "[general]\nbars = {NUM_BANDS}\nframerate = 60\n\
+             lower_cutoff_freq = {CAVA_LOWEST_HZ}\nhigher_cutoff_freq = {CAVA_HIGHEST_HZ}\n\
              [input]\nmethod = pulse\nsource = {source}\n\
              [output]\nmethod = raw\nchannels = mono\nraw_target = /dev/stdout\n\
              data_format = ascii\nascii_max_range = {CAVA_MAX_RANGE}\n\
-             bar_delimiter = 59\nframe_delimiter = 10\n"
+             bar_delimiter = 59\nframe_delimiter = 10\n\
+             [smoothing]\nnoise_reduction = {CAVA_NOISE_REDUCTION}\n"
         ),
     )
     .context("write cava config")?;
@@ -415,10 +463,7 @@ fn read_cava_output(bands: &Mutex<VisBands>, source: &str, cache_folder: &Path) 
         let line = line.context("read cava output")?;
         let mut values = [0.0f32; NUM_BANDS];
         for (value, field) in values.iter_mut().zip(line.split(';')) {
-            let level = field.parse::<f32>().unwrap_or(0.0) / CAVA_MAX_RANGE;
-            // cava's levels are already perceptual: square them to cancel the
-            // sqrt curve applied at render time.
-            *value = level * level;
+            *value = field.parse::<f32>().unwrap_or(0.0) / CAVA_MAX_RANGE;
         }
 
         let now = Instant::now();
@@ -429,8 +474,10 @@ fn read_cava_output(bands: &Mutex<VisBands>, source: &str, cache_folder: &Path) 
         guard.values = values;
         guard.updated_at = now;
         guard.peak_envelope = 1.0;
-        guard.is_active =
-            last_sound.is_some_and(|time| now.duration_since(time) < CAVA_SILENCE_TIMEOUT);
+        guard.transition(
+            last_sound.is_some_and(|time| now.duration_since(time) < CAVA_SILENCE_TIMEOUT),
+            now,
+        );
     }
 
     let status = child.wait().context("wait for cava")?;
@@ -464,24 +511,26 @@ pub fn render_audio_visualization(
     let display_decay = decay_for_elapsed(guard.updated_at.elapsed());
     let peak_norm =
         (guard.peak_envelope * peak_decay_for_elapsed(guard.updated_at.elapsed())).max(1e-6);
+    let glitch = guard.glitch_amount(Instant::now());
     // Copy the fixed-size array by value — no heap allocation.
     let values = guard.values;
     drop(guard);
+    let mut rng = rand::rng();
     let vis_colors = theme.visualization();
-    let num_bars = (rect.width as usize).min(values.len()).max(1);
+    let num_bars = (rect.width as usize).max(1);
     // Multiply by 8 to use ratatui's eighth-block characters (▁▂▃▄▅▆▇█),
     // giving 8× the resolution of whole terminal rows.
     let max_val = u64::from(rect.height) * 8;
 
-    let step = values.len() as f64 / num_bars as f64;
     let bars: Vec<Bar> = (0..num_bars)
         .map(|i| {
-            let idx = ((i as f64 * step) as usize).min(values.len() - 1);
             // Normalise against the slow peak envelope, then apply inter-frame decay.
             // Sqrt (gamma 0.5) scaling boosts quiet signals without clipping louds.
-            let norm = ((values[idx] * display_decay) / peak_norm)
+            let norm = ((band_at(&values, i, num_bars) * display_decay) / peak_norm)
                 .clamp(0.0, 1.0)
                 .powf(0.5);
+            // Random spikes give the glitch something to tear when the music is silent.
+            let norm = norm.max(rng.random::<f32>().powi(2) * glitch);
             let val = (norm * max_val as f32) as u64;
             Bar::default()
                 .value(val)
@@ -502,4 +551,117 @@ pub fn render_audio_visualization(
         .max(max_val);
 
     frame.render_widget(chart, rect);
+
+    if glitch > 0.0 {
+        tear_rows(
+            frame,
+            rect,
+            glitch,
+            [vis_colors.low, vis_colors.mid, vis_colors.high],
+        );
+    }
+}
+
+/// Band level for bar `i` of `num_bars`. Blends neighbouring bands so the chart can
+/// fill terminals wider than `NUM_BANDS` without looking blocky.
+fn band_at(values: &[f32; NUM_BANDS], i: usize, num_bars: usize) -> f32 {
+    if num_bars <= 1 {
+        return values[0];
+    }
+    let position = i as f32 * (NUM_BANDS - 1) as f32 / (num_bars - 1) as f32;
+    let lower = (position as usize).min(NUM_BANDS - 1);
+    let upper = (lower + 1).min(NUM_BANDS - 1);
+    let blend = position - lower as f32;
+    values[lower] * (1.0 - blend) + values[upper] * blend
+}
+
+/// Slide random rows sideways and scatter noise over them, like the rice's widget pop-ins.
+fn tear_rows(frame: &mut Frame, rect: Rect, amount: f32, [low, mid, high]: [Color; 3]) {
+    let width = i32::from(rect.width);
+    if width == 0 {
+        return;
+    }
+    let max_shift = ((width as f32 * GLITCH_MAX_SHIFT) as i32).max(1);
+    let buf = frame.buffer_mut();
+    let mut rng = rand::rng();
+    for y in rect.top()..rect.bottom() {
+        if rng.random::<f32>() >= amount {
+            continue;
+        }
+        let shift = rng.random_range(-max_shift..=max_shift);
+        let row: Vec<Cell> = (rect.left()..rect.right())
+            .map(|x| buf[(x, y)].clone())
+            .collect();
+        for (i, cell) in (0i32..).zip(row) {
+            let x = rect.left() + (i + shift).rem_euclid(width) as u16;
+            buf[(x, y)] = cell;
+        }
+        for x in rect.left()..rect.right() {
+            if rng.random::<f32>() < amount * 0.25 {
+                let glyph = GLITCH_GLYPHS[rng.random_range(0..GLITCH_GLYPHS.len())];
+                buf[(x, y)]
+                    .set_symbol(glyph)
+                    .set_fg(bar_color(rng.random::<f32>(), low, mid, high));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bars_span_every_band_at_any_width() {
+        let mut values = [0.0f32; NUM_BANDS];
+        values[0] = 0.25;
+        values[NUM_BANDS - 1] = 0.75;
+        for num_bars in [2, 80, NUM_BANDS, 280, 500] {
+            assert!((band_at(&values, 0, num_bars) - 0.25).abs() < 1e-3);
+            assert!((band_at(&values, num_bars - 1, num_bars) - 0.75).abs() < 1e-3);
+        }
+        assert!((band_at(&values, 0, 1) - 0.25).abs() < 1e-3);
+    }
+
+    #[test]
+    fn glitch_fades_out_after_opening() {
+        let start = Instant::now();
+        let mut bands = VisBands::new();
+        bands.transition(true, start);
+        assert!(bands.is_active);
+        assert!((bands.glitch_amount(start) - 1.0).abs() < f32::EPSILON);
+        assert!(bands.glitch_amount(start + GLITCH_DURATION).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn chart_stays_open_until_the_closing_glitch_ends() {
+        let start = Instant::now();
+        let mut bands = VisBands::new();
+        bands.transition(true, start);
+
+        let closing = start + Duration::from_secs(1);
+        bands.transition(false, closing);
+        assert!(bands.is_active);
+        assert!(bands.glitch_amount(closing).abs() < f32::EPSILON);
+
+        let done = closing + GLITCH_DURATION;
+        assert!((bands.glitch_amount(done) - 1.0).abs() < f32::EPSILON);
+        bands.transition(false, done);
+        assert!(!bands.is_active);
+    }
+
+    #[test]
+    fn sound_returning_cancels_closing_without_reopening() {
+        let start = Instant::now();
+        let mut bands = VisBands::new();
+        bands.transition(true, start);
+
+        let closing = start + Duration::from_secs(1);
+        bands.transition(false, closing);
+        bands.transition(true, closing + Duration::from_millis(100));
+
+        assert!(bands.is_active);
+        assert!(bands.closing_at.is_none());
+        assert!(bands.glitch_amount(closing + Duration::from_millis(100)).abs() < f32::EPSILON);
+    }
 }
