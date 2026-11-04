@@ -1,5 +1,6 @@
 use super::config;
 use crate::state::SharedState;
+use anyhow::{Context, Result};
 use librespot_playback::{
     audio_backend::{Sink, SinkResult},
     convert::Converter,
@@ -14,8 +15,11 @@ use ratatui::{
 };
 use rustfft::{num_complex::Complex, FftPlanner};
 use std::collections::VecDeque;
+use std::io::{BufRead, BufReader};
+use std::path::Path;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const FFT_SIZE: usize = 1024;
 /// Number of new samples consumed per FFT frame (overlap = `FFT_SIZE` - `HOP_SIZE`).
@@ -360,6 +364,77 @@ fn bar_color(t: f32, low: Color, mid: Color, high: Color) -> Color {
     } else {
         lerp_color(mid, high, (t - 0.5) * 2.0)
     }
+}
+
+/// Keep the chart up through short silences, e.g. the gap between two tracks.
+const CAVA_SILENCE_TIMEOUT: Duration = Duration::from_secs(2);
+const CAVA_RESTART_DELAY: Duration = Duration::from_secs(5);
+const CAVA_MAX_RANGE: f32 = 1000.0;
+
+/// Feed the visualization from a `cava` process capturing the given `PulseAudio` source,
+/// so playback on another local player (a Spotify Connect device) can be visualized.
+/// Never returns; restarts `cava` if it fails.
+pub fn run_cava_visualization(state: &SharedState, source: &str, cache_folder: &Path) {
+    let Some(bands) = state.vis_bands.as_ref() else {
+        return;
+    };
+    loop {
+        if let Err(err) = read_cava_output(bands, source, cache_folder) {
+            tracing::error!("Failed to run cava for audio visualization: {err:#}");
+        }
+        bands.lock().is_active = false;
+        std::thread::sleep(CAVA_RESTART_DELAY);
+    }
+}
+
+fn read_cava_output(bands: &Mutex<VisBands>, source: &str, cache_folder: &Path) -> Result<()> {
+    let config_path = cache_folder.join("cava-visualization.conf");
+    std::fs::write(
+        &config_path,
+        format!(
+            "[general]\nbars = {NUM_BANDS}\nframerate = 60\n\
+             [input]\nmethod = pulse\nsource = {source}\n\
+             [output]\nmethod = raw\nchannels = mono\nraw_target = /dev/stdout\n\
+             data_format = ascii\nascii_max_range = {CAVA_MAX_RANGE}\n\
+             bar_delimiter = 59\nframe_delimiter = 10\n"
+        ),
+    )
+    .context("write cava config")?;
+
+    let mut child = Command::new("cava")
+        .arg("-p")
+        .arg(&config_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("start cava")?;
+    let stdout = child.stdout.take().context("get cava stdout")?;
+
+    let mut last_sound: Option<Instant> = None;
+    for line in BufReader::new(stdout).lines() {
+        let line = line.context("read cava output")?;
+        let mut values = [0.0f32; NUM_BANDS];
+        for (value, field) in values.iter_mut().zip(line.split(';')) {
+            let level = field.parse::<f32>().unwrap_or(0.0) / CAVA_MAX_RANGE;
+            // cava's levels are already perceptual: square them to cancel the
+            // sqrt curve applied at render time.
+            *value = level * level;
+        }
+
+        let now = Instant::now();
+        if values.iter().any(|value| *value > 0.0) {
+            last_sound = Some(now);
+        }
+        let mut guard = bands.lock();
+        guard.values = values;
+        guard.updated_at = now;
+        guard.peak_envelope = 1.0;
+        guard.is_active =
+            last_sound.is_some_and(|time| now.duration_since(time) < CAVA_SILENCE_TIMEOUT);
+    }
+
+    let status = child.wait().context("wait for cava")?;
+    anyhow::bail!("cava exited: {status}")
 }
 
 /// Render a frequency-band bar chart using live FFT data from the audio sink.

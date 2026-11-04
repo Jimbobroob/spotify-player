@@ -120,6 +120,9 @@ pub struct AppConfig {
     #[cfg(feature = "streaming")]
     pub enable_audio_visualization: bool,
 
+    #[cfg(feature = "streaming")]
+    pub audio_visualization_cava_source: Option<String>,
+
     #[cfg(feature = "notify")]
     pub enable_notify: bool,
 
@@ -387,6 +390,9 @@ impl Default for AppConfig {
 
             #[cfg(feature = "streaming")]
             enable_audio_visualization: false,
+
+            #[cfg(feature = "streaming")]
+            audio_visualization_cava_source: None,
 
             #[cfg(feature = "notify")]
             enable_notify: true,

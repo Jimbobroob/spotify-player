@@ -144,6 +144,22 @@ async fn start_app(state: &state::SharedState) -> Result<()> {
         }
     });
 
+    #[cfg(feature = "streaming")]
+    {
+        let configs = config::get_config();
+        if configs.app_config.enable_audio_visualization {
+            if let Some(source) = configs.app_config.audio_visualization_cava_source.clone() {
+                let cache_folder = configs.cache_folder.clone();
+                std::thread::Builder::new()
+                    .name("cava-visualization".to_string())
+                    .spawn({
+                        let state = state.clone();
+                        move || ui::streaming::run_cava_visualization(&state, &source, &cache_folder)
+                    })?;
+            }
+        }
+    }
+
     // background task that detects an invalidated session and reconnects,
     // independent of any incoming client request
     tokio::task::spawn({
